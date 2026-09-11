@@ -1,0 +1,10 @@
+# Arquivos temporários do Python
+__pycache__/
+*.py[cod]
+
+# Arquivos gerados pelo programa
+saidas/
+
+# Manter somente a pasta de entradas no repositório
+inputs/*
+!inputs/.gitkeep
