@@ -5,6 +5,11 @@ __pycache__/
 # Arquivos gerados pelo programa
 saidas/
 
+# Artefatos auxiliares de tarefas de planilha e dependências locais
+/outputs/
+/tests/
+node_modules/
+
 # Manter somente a pasta de entradas no repositório
 inputs/*
 !inputs/.gitkeep

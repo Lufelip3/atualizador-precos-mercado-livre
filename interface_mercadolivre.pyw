@@ -62,6 +62,7 @@ class AtualizadorMercadoLivreApp:
             darkcolor=self.COR_BTN_ACAO,
         )
 
+        self.modo = tk.StringVar(value=motor.MODOS["estoque"])
         self._criar_widgets()
         self.atualizar_painel_de_status()
 
@@ -85,6 +86,15 @@ class AtualizadorMercadoLivreApp:
             bg=self.COR_BG_HEADER,
             fg=self.COR_SUBTITULO,
         ).pack()
+
+        frame_modo = tk.Frame(self.root, bg=self.COR_BG_RAIZ)
+        frame_modo.pack(fill=tk.X, padx=24, pady=(10, 0))
+        tk.Label(frame_modo, text="O que atualizar?", bg=self.COR_BG_RAIZ,
+                 fg=self.COR_LABEL).pack(side=tk.LEFT, padx=(0, 12))
+        self.seletor_modo = ttk.Combobox(frame_modo, textvariable=self.modo,
+                                        values=list(motor.MODOS.values()), state="readonly", width=22)
+        self.seletor_modo.pack(side=tk.LEFT)
+        self.seletor_modo.bind("<<ComboboxSelected>>", lambda evento: self.atualizar_painel_de_status())
 
         # ── PAINEL DE STATUS ───────────
         self.frame_status = tk.Frame(self.root, bg=self.COR_BG_PAINEL, pady=10)
@@ -197,18 +207,21 @@ class AtualizadorMercadoLivreApp:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
     # ── DETECCAO DE ARQUIVOS (para o painel de status) ──────────────────
+    def modo_selecionado(self):
+        return next(chave for chave, titulo in motor.MODOS.items() if titulo == self.modo.get())
+
     def detectar_arquivos(self):
         """Detecta as duas entradas necessárias usando o motor do programa."""
         arquivo_bling = None
         arquivo_anuncios, aba_anuncios = None, None
 
         try:
-            arquivo_anuncios, aba_anuncios = motor.localizar_arquivo_anuncios_ml(exibir_log=False)
+            arquivo_anuncios, aba_anuncios = motor.localizar_arquivo_anuncios_ml(exibir_log=False, modo=self.modo_selecionado())
         except Exception:
             pass
 
         try:
-            arquivo_bling = motor.localizar_arquivo_bling(exibir_log=False)
+            arquivo_bling = motor.localizar_arquivo_bling(exibir_log=False, modo=self.modo_selecionado())
         except Exception:
             pass
 
@@ -240,12 +253,12 @@ class AtualizadorMercadoLivreApp:
         if arquivo_bling:
             linha(f"  OK   Bling (catalogo): {os.path.basename(arquivo_bling)}", "#4ec94e")
         else:
-            linha("  FALTA   Bling (catalogo): nenhum CSV com Codigo/Preco/Estoque encontrado", "#ff6b6b")
+            linha(f"  FALTA   CSV do Bling compatível com {self.modo.get()}", "#ff6b6b")
 
         if arquivo_anuncios:
             linha(f"  OK   Anuncios Mercado Livre: {os.path.basename(arquivo_anuncios)}  [aba: {aba_anuncios}]", "#4ec94e")
         else:
-            linha("  FALTA   Anuncios Mercado Livre: planilha com SKU/QUANTITY/PRICE não encontrada", "#ff6b6b")
+            linha(f"  SEM PLANILHA COMPATÍVEL: exige {motor.colunas_exigidas(self.modo_selecionado())}", "#ff6b6b")
 
     # ── PASTA DE SAIDA ───────────────────────────────────────────────────
     def abrir_pasta_saidas(self):
@@ -287,6 +300,7 @@ class AtualizadorMercadoLivreApp:
 
     # ── EXECUCAO ───────────────────────────────────────────────────────
     def executar_atualizacao(self):
+        modo = self.modo_selecionado()
         self.atualizar_painel_de_status()
         arquivo_bling, (arquivo_anuncios, _) = self.detectar_arquivos()
 
@@ -294,16 +308,17 @@ class AtualizadorMercadoLivreApp:
         if not arquivo_bling:
             faltando.append("catalogo do Bling (CSV)")
         if not arquivo_anuncios:
-            faltando.append("planilha oficial do Mercado Livre com SKU (XLSX)")
+            faltando.append(f"planilha do Mercado Livre com {motor.colunas_exigidas(modo)} (XLSX)")
 
         if faltando:
             messagebox.showerror(
-                "Arquivo(s) nao encontrado(s)",
-                "Nao foi possivel iniciar. Faltam na pasta inputs/:\n\n- " + "\n- ".join(faltando),
+                "Arquivos ausentes ou incompatíveis",
+                f"Não foi possível iniciar no modo {motor.MODOS[modo]}.\nConfira em inputs/:\n\n- " + "\n- ".join(faltando),
             )
             return
 
         self.btn_executar.config(state="disabled")
+        self.seletor_modo.config(state="disabled")
         self.btn_abrir.config(state="disabled")
         self.btn_relatorio.config(state="disabled")
 
@@ -320,7 +335,7 @@ class AtualizadorMercadoLivreApp:
             try:
                 caminho_script = os.path.join(PASTA_BASE, "script_mercadolivre.py")
                 processo = subprocess.Popen(
-                    [sys.executable, "-u", caminho_script],
+                    [sys.executable, "-u", caminho_script, "--modo", modo],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -342,6 +357,7 @@ class AtualizadorMercadoLivreApp:
         threading.Thread(target=rodar_em_segundo_plano, daemon=True).start()
 
     def finalizar_execucao(self, codigo_retorno):
+        self.seletor_modo.config(state="readonly")
         self.barra_progresso.stop()
         self.btn_executar.config(state="normal")
         self.btn_abrir.config(state="normal")
@@ -367,6 +383,7 @@ class AtualizadorMercadoLivreApp:
             messagebox.showerror("Erro", "Ocorreu um erro.\nVeja o log para detalhes.")
 
     def finalizar_com_erro(self, mensagem_erro: str):
+        self.seletor_modo.config(state="readonly")
         self.barra_progresso.stop()
         self.btn_executar.config(state="normal")
         self.btn_abrir.config(state="normal")

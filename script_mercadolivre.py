@@ -1,13 +1,14 @@
 """Atualiza preço e estoque do Mercado Livre diretamente pelo SKU.
 
 Entradas em ``inputs/``:
-- CSV do Bling com Código, Preço e Estoque.
-- XLSX oficial do Mercado Livre com SKU, PRICE e QUANTITY.
+- CSV do Bling com Código e os campos selecionados no modo de atualização.
+- XLSX oficial do Mercado Livre com SKU e PRICE e/ou QUANTITY, conforme o modo.
 
-Somente células editáveis de PRICE e QUANTITY com valores diferentes são
-alteradas. O restante da estrutura do XLSX é preservado.
+Somente células editáveis de PRICE e, quando presente, QUANTITY com valores
+diferentes são alteradas. O restante da estrutura do XLSX é preservado.
 """
 
+import argparse
 import csv
 import glob
 import os
@@ -24,7 +25,8 @@ from datetime import datetime
 import openpyxl
 
 
-sys.stdout.reconfigure(encoding="utf-8")
+if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 PASTA_INPUTS = "inputs"
@@ -35,6 +37,18 @@ COR_VERDE = "\033[92m"
 COR_LARANJA = "\033[33m"
 COR_RESET = "\033[0m"
 PADRAO_ITEM_ID = re.compile(r"^MLB\d+$")
+MODOS = {"estoque": "Só estoque", "preco": "Só preço", "ambos": "Preço e estoque"}
+
+
+def campos_do_modo(modo="ambos"):
+    if modo not in MODOS:
+        raise ValueError(f"Modo inválido: {modo}")
+    return {"estoque": ("QUANTITY",), "preco": ("PRICE",),
+            "ambos": ("PRICE", "QUANTITY")}[modo]
+
+
+def colunas_exigidas(modo="ambos"):
+    return "/".join(("SKU",) + campos_do_modo(modo))
 
 
 def remover_acentos(valor) -> str:
@@ -52,7 +66,7 @@ def limpar_sku(valor) -> str:
 
 
 def converter_numero_br(valor) -> float:
-    texto = str(valor or "").strip().replace("R$", "").replace(" ", "")
+    texto = "" if valor is None else str(valor).strip().replace("R$", "").replace(" ", "")
     if not texto:
         raise ValueError("valor numérico vazio")
     if "," in texto:
@@ -93,7 +107,8 @@ def _encontrar_coluna(colunas: list[str], termos: tuple[str, ...], excluir=()) -
     return None
 
 
-def localizar_arquivo_bling(exibir_log: bool = True) -> str:
+def localizar_arquivo_bling(exibir_log: bool = True, modo="ambos") -> str:
+    campos = campos_do_modo(modo)
     candidatos = []
     for caminho in glob.glob(os.path.join(PASTA_INPUTS, "*.csv")):
         try:
@@ -101,44 +116,48 @@ def localizar_arquivo_bling(exibir_log: bool = True) -> str:
             codigo = _encontrar_coluna(colunas, ("codigo",)) or _encontrar_coluna(colunas, ("sku",))
             preco = _encontrar_coluna(colunas, ("preco",), ("custo", "promocional", "compra"))
             estoque = _encontrar_coluna(colunas, ("estoque",), ("minimo", "maximo"))
-            if codigo and preco and estoque:
+            if codigo and (preco or "PRICE" not in campos) and (estoque or "QUANTITY" not in campos):
                 candidatos.append(caminho)
         except (OSError, UnicodeError):
             continue
     if not candidatos:
-        raise FileNotFoundError("CSV do Bling com Código, Preço e Estoque não encontrado em inputs/.")
+        raise FileNotFoundError(f"CSV do Bling compatível com {MODOS[modo]} não encontrado em inputs/.")
     escolhido = max(candidatos, key=os.path.getmtime)
     if exibir_log:
         print(f"Catálogo Bling       : {escolhido}")
     return escolhido
 
 
-def _localizar_cabecalho_ml(ws):
-    for linha in ws.iter_rows(min_row=1, max_row=min(10, ws.max_row)):
+def _localizar_cabecalho_ml(ws, modo="ambos"):
+    campos = ("SKU",) + campos_do_modo(modo)
+    for linha in ws.iter_rows(min_row=1, max_row=min(10, ws.max_row or 10)):
         valores = [celula.value for celula in linha]
-        if all(campo in valores for campo in ("SKU", "QUANTITY", "PRICE")):
+        if all(campo in valores for campo in campos):
             return linha[0].row, {valor: i + 1 for i, valor in enumerate(valores) if valor}
     return None, {}
 
 
-def localizar_arquivo_anuncios_ml(exibir_log: bool = True) -> tuple[str, str]:
+def localizar_arquivo_anuncios_ml(exibir_log: bool = True, modo="ambos") -> tuple[str, str]:
+    campos_do_modo(modo)
     candidatos = []
     for caminho in glob.glob(os.path.join(PASTA_INPUTS, "*.xlsx")):
         if os.path.basename(caminho).startswith("~$"):
             continue
         try:
             wb = openpyxl.load_workbook(caminho, read_only=True, data_only=False)
-            for ws in wb.worksheets:
-                linha, _ = _localizar_cabecalho_ml(ws)
-                if linha:
-                    candidatos.append((caminho, ws.title))
-                    break
-            wb.close()
+            try:
+                for ws in wb.worksheets:
+                    linha, _ = _localizar_cabecalho_ml(ws, modo)
+                    if linha:
+                        candidatos.append((caminho, ws.title))
+                        break
+            finally:
+                wb.close()
         except Exception:
             continue
     if not candidatos:
         raise FileNotFoundError(
-            "Planilha oficial do Mercado Livre com SKU, QUANTITY e PRICE não encontrada em inputs/."
+            f"Nenhum XLSX compatível em inputs/: este modo exige {colunas_exigidas(modo)}."
         )
     caminho, aba = max(candidatos, key=lambda item: os.path.getmtime(item[0]))
     if exibir_log:
@@ -146,15 +165,16 @@ def localizar_arquivo_anuncios_ml(exibir_log: bool = True) -> tuple[str, str]:
     return caminho, aba
 
 
-def carregar_catalogo_bling(caminho: str) -> dict[str, dict]:
+def carregar_catalogo_bling(caminho: str, modo="ambos") -> dict[str, dict]:
+    campos = campos_do_modo(modo)
     with open(caminho, "r", encoding="utf-8-sig", newline="") as arquivo:
         leitor = csv.DictReader(arquivo, delimiter=";")
         colunas = leitor.fieldnames or []
         col_sku = _encontrar_coluna(colunas, ("codigo",)) or _encontrar_coluna(colunas, ("sku",))
         col_preco = _encontrar_coluna(colunas, ("preco",), ("custo", "promocional", "compra"))
         col_estoque = _encontrar_coluna(colunas, ("estoque",), ("minimo", "maximo"))
-        if not col_sku or not col_preco or not col_estoque:
-            raise ValueError("Não foi possível identificar Código, Preço e Estoque no CSV do Bling.")
+        if not col_sku or ("PRICE" in campos and not col_preco) or ("QUANTITY" in campos and not col_estoque):
+            raise ValueError(f"CSV do Bling sem as colunas necessárias para {MODOS[modo]}.")
 
         catalogo = {}
         duplicados = set()
@@ -163,10 +183,10 @@ def carregar_catalogo_bling(caminho: str) -> dict[str, dict]:
             if not sku:
                 continue
             try:
-                preco = round(converter_numero_br(linha.get(col_preco)), 2)
-                estoque = int(round(converter_numero_br(linha.get(col_estoque))))
-            except ValueError:
-                print(f"{COR_VERMELHO}SKU {sku} ignorado: preço ou estoque inválido no CSV.{COR_RESET}")
+                preco = round(converter_numero_br(linha.get(col_preco)), 2) if "PRICE" in campos else None
+                estoque = int(round(converter_numero_br(linha.get(col_estoque)))) if "QUANTITY" in campos else None
+            except (ValueError, OverflowError):
+                print(f"{COR_VERMELHO}SKU {sku} ignorado: valor inválido para {MODOS[modo]} no CSV.{COR_RESET}")
                 continue
             if sku in catalogo:
                 duplicados.add(sku)
@@ -264,13 +284,14 @@ def salvar_alterando_somente_celulas(
         raise
 
 
-def atualizar_planilha_ml(caminho_xlsx: str, nome_aba: str, catalogo: dict[str, dict]):
+def atualizar_planilha_ml(caminho_xlsx: str, nome_aba: str, catalogo: dict[str, dict], modo="ambos"):
+    campos_ativos = campos_do_modo(modo)
     wb = openpyxl.load_workbook(caminho_xlsx, read_only=True, data_only=False)
     ws = wb[nome_aba]
-    linha_cabecalho, colunas = _localizar_cabecalho_ml(ws)
+    linha_cabecalho, colunas = _localizar_cabecalho_ml(ws, modo)
     if not linha_cabecalho:
         wb.close()
-        raise ValueError("Cabeçalho SKU/QUANTITY/PRICE não encontrado na planilha do ML.")
+        raise ValueError(f"Este modo exige {colunas_exigidas(modo)} na planilha do ML.")
 
     alteracoes = {}
     anuncios_alterados = set()
@@ -281,25 +302,28 @@ def atualizar_planilha_ml(caminho_xlsx: str, nome_aba: str, catalogo: dict[str, 
     linhas_analisadas = 0
     linhas_encontradas_no_bling = 0
     col_item = colunas.get("ITEM_ID")
+    tem_quantidade = "QUANTITY" in colunas
 
     for linha in ws.iter_rows(min_row=linha_cabecalho + 1, max_row=ws.max_row):
         item_id = str(linha[col_item - 1].value or "").strip() if col_item else ""
         if col_item and not PADRAO_ITEM_ID.match(item_id):
             continue
         sku = limpar_sku(linha[colunas["SKU"] - 1].value)
-        celula_preco = linha[colunas["PRICE"] - 1]
-        celula_quantidade = linha[colunas["QUANTITY"] - 1]
+        celula_preco = linha[colunas["PRICE"] - 1] if "PRICE" in colunas else None
+        celula_quantidade = linha[colunas["QUANTITY"] - 1] if tem_quantidade else None
         relacao = {
             "item_id": item_id or "sem ITEM_ID",
             "sku": sku or "sem SKU",
-            "celula_price": celula_preco.coordinate,
-            "price_ml": celula_preco.value,
+            "celula_price": celula_preco.coordinate if celula_preco else "",
+            "price_ml": celula_preco.value if celula_preco else "",
             "price_bling": "",
-            "status_price": "SEM SKU NA PLANILHA",
-            "celula_quantity": celula_quantidade.coordinate,
-            "quantity_ml": celula_quantidade.value,
+            "status_price": "SEM SKU NA PLANILHA" if "PRICE" in campos_ativos else "NÃO SELECIONADO",
+            "celula_quantity": celula_quantidade.coordinate if celula_quantidade else "",
+            "quantity_ml": celula_quantidade.value if celula_quantidade else "",
             "quantity_bling": "",
-            "status_quantity": "SEM SKU NA PLANILHA",
+            "status_quantity": (
+                "SEM SKU NA PLANILHA" if "QUANTITY" in campos_ativos else "NÃO SELECIONADO"
+            ),
         }
         if not sku:
             relacoes.append(relacao)
@@ -308,19 +332,22 @@ def atualizar_planilha_ml(caminho_xlsx: str, nome_aba: str, catalogo: dict[str, 
         produto = catalogo.get(sku)
         if not produto:
             sem_sku_no_bling.setdefault(sku, set()).add(item_id or "sem ITEM_ID")
-            relacao["status_price"] = "SKU AUSENTE NO BLING"
-            relacao["status_quantity"] = "SKU AUSENTE NO BLING"
+            if "PRICE" in campos_ativos:
+                relacao["status_price"] = "SKU AUSENTE NO BLING"
+            if "QUANTITY" in campos_ativos:
+                relacao["status_quantity"] = "SKU AUSENTE NO BLING"
             relacoes.append(relacao)
             continue
         linhas_encontradas_no_bling += 1
-        relacao["price_bling"] = produto["preco"]
-        relacao["quantity_bling"] = produto["estoque"]
+        relacao["price_bling"] = produto.get("preco", "") if "PRICE" in campos_ativos else ""
+        relacao["quantity_bling"] = produto.get("estoque", "") if "QUANTITY" in campos_ativos else ""
 
         item_id = item_id or sku
-        campos = (
-            ("PRICE", produto["preco"], 0.001, "status_price"),
-            ("QUANTITY", produto["estoque"], 0.0, "status_quantity"),
-        )
+        campos = []
+        if "PRICE" in campos_ativos:
+            campos.append(("PRICE", produto["preco"], 0.001, "status_price"))
+        if "QUANTITY" in campos_ativos:
+            campos.append(("QUANTITY", produto["estoque"], 0.0, "status_quantity"))
         for campo, valor_novo, tolerancia, chave_status in campos:
             celula = linha[colunas[campo] - 1]
             if valores_numericos_iguais(celula.value, valor_novo, tolerancia):
@@ -345,6 +372,7 @@ def atualizar_planilha_ml(caminho_xlsx: str, nome_aba: str, catalogo: dict[str, 
     caminho_saida = os.path.join(PASTA_SAIDA, f"{nome_base}_atualizado.xlsx")
     salvar_alterando_somente_celulas(caminho_xlsx, caminho_saida, nome_aba, alteracoes)
     return {
+        "modo": modo,
         "anuncios_alterados": anuncios_alterados,
         "celulas_alteradas": len(alteracoes),
         "sem_sku_no_bling": sem_sku_no_bling,
@@ -353,6 +381,7 @@ def atualizar_planilha_ml(caminho_xlsx: str, nome_aba: str, catalogo: dict[str, 
         "relacoes": relacoes,
         "linhas_analisadas": linhas_analisadas,
         "linhas_encontradas_no_bling": linhas_encontradas_no_bling,
+        "coluna_quantidade_presente": tem_quantidade,
     }, caminho_saida
 
 
@@ -368,6 +397,7 @@ def gerar_relatorio_txt(resumo: dict, arquivo_bling: str, arquivo_ml: str, camin
         arquivo.write("RELATÓRIO DE ATUALIZAÇÃO — MERCADO LIVRE\n")
         arquivo.write("=" * 80 + "\n")
         arquivo.write(f"Data e hora: {datetime.now():%d/%m/%Y %H:%M:%S}\n")
+        arquivo.write(f"Modo: {MODOS[resumo['modo']]}\n")
         arquivo.write(f"Catálogo Bling: {os.path.abspath(arquivo_bling)}\n")
         arquivo.write(f"Planilha Mercado Livre: {os.path.abspath(arquivo_ml)}\n")
         arquivo.write(f"Planilha gerada: {os.path.abspath(caminho_saida)}\n\n")
@@ -380,6 +410,17 @@ def gerar_relatorio_txt(resumo: dict, arquivo_bling: str, arquivo_ml: str, camin
         arquivo.write(f"Células alteradas: {resumo['celulas_alteradas']}\n")
         arquivo.write(f"SKUs ausentes no Bling: {len(resumo['sem_sku_no_bling'])}\n")
         arquivo.write(f"Campos bloqueados: {len(resumo['campos_bloqueados'])}\n\n")
+        arquivo.write("ALTERAÇÕES REALIZADAS NA PLANILHA GERADA\n")
+        arquivo.write("-" * 80 + "\n")
+        if not resumo["detalhes_alteracoes"]:
+            arquivo.write("Nenhuma célula foi alterada nesta execução.\n")
+        for item_id, sku, campo, celula, anterior, novo in resumo["detalhes_alteracoes"]:
+            nome_campo = "Estoque" if campo == "QUANTITY" else "Preço"
+            arquivo.write(
+                f"SKU {sku} | Anúncio {item_id} | {nome_campo}: "
+                f"{anterior if anterior is not None else '(vazio)'} -> {novo} | Célula {celula}\n"
+            )
+        arquivo.write("\n")
         arquivo.write("RELAÇÕES DETALHADAS\n")
         arquivo.write("-" * 80 + "\n")
         arquivo.write(cabecalho_colunas + "\n")
@@ -417,18 +458,19 @@ def limpar_pasta_saida():
             pass
 
 
-def main():
+def main(modo="ambos"):
     print("=" * 60)
     print("ATUALIZADOR DE PREÇO E ESTOQUE — MERCADO LIVRE")
     print("=" * 60)
+    print(f"Modo: {MODOS[modo]}")
+    arquivo_bling = localizar_arquivo_bling(modo=modo)
+    arquivo_ml, aba_ml = localizar_arquivo_anuncios_ml(modo=modo)
+    catalogo = carregar_catalogo_bling(arquivo_bling, modo=modo)
     limpar_pasta_saida()
-    arquivo_bling = localizar_arquivo_bling()
-    arquivo_ml, aba_ml = localizar_arquivo_anuncios_ml()
-    catalogo = carregar_catalogo_bling(arquivo_bling)
     print(f"{len(catalogo)} produto(s) carregado(s) do Bling.")
     print("\nAtualizando pelo SKU da própria planilha do Mercado Livre...")
 
-    resumo, caminho_saida = atualizar_planilha_ml(arquivo_ml, aba_ml, catalogo)
+    resumo, caminho_saida = atualizar_planilha_ml(arquivo_ml, aba_ml, catalogo, modo=modo)
     caminho_relatorio = gerar_relatorio_txt(resumo, arquivo_bling, arquivo_ml, caminho_saida)
     print(f"Linhas de anúncios analisadas: {resumo['linhas_analisadas']}")
     print(f"Linhas com SKU encontrado no Bling: {resumo['linhas_encontradas_no_bling']}")
@@ -438,6 +480,12 @@ def main():
     )
     print(f"Saída: {caminho_saida}")
     print(f"Relatório: {caminho_relatorio}")
+
+    if resumo["celulas_alteradas"] == 0:
+        print(
+            f"\n{COR_VERDE}Nenhuma alteração necessária: os campos disponíveis e "
+            f"editáveis já estão sincronizados com o Bling.{COR_RESET}"
+        )
 
     if resumo["detalhes_alteracoes"]:
         print("\nALTERAÇÕES REALIZADAS:")
@@ -478,8 +526,11 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Atualiza campos selecionados pelo SKU.")
+    parser.add_argument("--modo", choices=MODOS, default="ambos")
+    args = parser.parse_args()
     try:
-        main()
+        main(args.modo)
     except Exception as erro:
         print(f"\n{COR_VERMELHO}ERRO: {erro}{COR_RESET}")
         raise
